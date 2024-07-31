@@ -23,6 +23,7 @@ for env_var in REQUIRED_ENV_VARS:
 # If is_developer_view is True then there's additional functionalities available.
 IS_DEVELOPER_VIEW = True
 ON_LOCALHOST = False
+MCM_SKILL = "Classification"
 MCM_URL = "https://classification.dilab-ivy.com/ivy/ask_question"
 SKILL_NAME_TO_MCM_URL = {
     "Classification": "https://classification.dilab-ivy.com/ivy/ask_question",
@@ -58,11 +59,22 @@ USER_NAME = ""
 USERNAME = ""
 USER_EMAIL = ""
 
+EVALUATION_QUESTIONS = []
+EVALUATION_QUESTION_NUM = 0
+EVALUATION_METRIC_DESCRIPTION = {
+    "Correctness": "A response with high correctness should be factually accurate (based on TMK) to the question or context",
+    "Completeness": "A response with high completeness satisfactorily covers all aspects of a user’s query, ensuring no critical information is left out",
+    "Confidence": "A response with high confidence is indicated by straightforward, factual answers, while terms like 'not sure,' 'likely,' or 'could be' signify medium to low confidence",
+    "Comprehensibility": "A response with high comprehensibility is easy to understand, useful and/or actionable. Reduces the likelihood of misunderstandings or need for follow-up questions",
+    "Compactness": "A response with high compactness is clear and to the point, without unnecessary elaboration",
+}
 
 # Initialize DynamoDB
 dynamodb = boto3.resource("dynamodb")
 login_table = dynamodb.Table("UserLogin")
 chat_history_table = dynamodb.Table("ChatHistory")
+evaluation_questions_table = dynamodb.Table("EvalQuestions")
+evaluation_responses_table = dynamodb.Table("Evaluation")
 
 app = FastAPI()
 
@@ -181,6 +193,9 @@ with gr.Blocks() as ivy_main_page:
                         value=60,
                         interactive=True,
                     )
+        goto_eval_page_btn = gr.Button(
+            value="Evaluate Ivy", link="/evaluation", scale=0.5
+        )
 
     chatbot = gr.Chatbot(
         label="Your Conversation",
@@ -205,15 +220,27 @@ with gr.Blocks() as ivy_main_page:
             value="Download Flagged Responses", variant="secondary", visible=IS_DEVELOPER_VIEW
         )
 
-    def on_page_load(request: gr.Request):
-        if "code" not in dict(request.query_params):
-            # (TODO): Redirect to login page
-            return "Go back to login page"
-        url_code = dict(request.query_params)["code"]
-        if not get_access_token_and_user_info(url_code):
-            # (TODO): Redirect to Login page or display Error page
-            return "An Error Occurred"
-        return f"# Welcome to Ivy Chatbot, {USER_NAME}"
+    def update_skill(skill_name):
+        global MCM_SKILL
+        global MCM_URL
+        MCM_SKILL = skill_name
+        MCM_URL = SKILL_NAME_TO_MCM_URL[skill_name]
+        return []
+
+    def on_askivy_page_load(skill_name, request: gr.Request):
+        if not ACCESS_TOKEN:
+            if "code" not in dict(request.query_params):
+                # (TODO): Redirect to login page
+                return "Go back to login page"
+            url_code = dict(request.query_params)["code"]
+            if not get_access_token_and_user_info(url_code):
+                # (TODO): Redirect to Login page or display Error page
+                return "An Error Occurred"
+
+        if MCM_SKILL:
+            skill_name = MCM_SKILL
+        update_skill(skill_name)
+        return [f"# Welcome to Ivy Chatbot, {USER_NAME}", skill_name]
 
     def log_chat_history(user_id, session_id, question, response, reaction):
         timestamp = time.time()
@@ -352,12 +379,7 @@ with gr.Blocks() as ivy_main_page:
         filepath = generate_csv(USERNAME, ACCESS_TOKEN)
         return filepath if filepath else None
 
-    def update_skill(skill_name):
-        global MCM_URL
-        MCM_URL = SKILL_NAME_TO_MCM_URL[skill_name]
-        return []
-
-    ivy_main_page.load(on_page_load, None, [welcome_msg])
+    ivy_main_page.load(on_askivy_page_load, [mcm_skill], [welcome_msg, mcm_skill])
     mcm_skill.change(update_skill, [mcm_skill], [chatbot])
     msg.submit(
         update_user_message, [msg, chatbot], [msg, chatbot], queue=False
@@ -377,10 +399,336 @@ with gr.Blocks() as ivy_main_page:
 # Launch the Application
 ivy_main_page.queue()
 
-with gr.Blocks() as evaluation_page:
-    # Develop Evaluation page
-    # Placeholder interface
-    gr.Interface(lambda x: f"Hello {x}!", inputs="text", outputs="text")
+evaluation_css = open("css/evaluation.css", "r").read()
+with gr.Blocks(
+    theme=gr.themes.Default(
+        primary_hue=gr.themes.colors.teal, secondary_hue=gr.themes.colors.red
+    ),
+    css=evaluation_css,
+) as evaluation_page:
+    # Title
+    welcome_msg = gr.Markdown()
+    # Settings
+    with gr.Row():
+        mcm_skill = gr.Dropdown(
+            choices=SKILL_NAME_TO_MCM_URL.keys(),
+            value="Classification",
+            multiselect=False,
+            label="Skill",
+            interactive=True,
+        )
+        with gr.Accordion("Settings", open=False, visible=IS_DEVELOPER_VIEW):
+            # MCM Settings
+            with gr.Group("MCM Settings"):
+                with gr.Row():
+                    # MCM API Key
+                    mcm_api_key = gr.Textbox(
+                        value="123456789",
+                        label="MCM API Key",
+                        interactive=True,
+                    )
+                    timeout_secs = gr.Slider(
+                        label="Timeout (seconds)",
+                        minimum=5,
+                        maximum=300,
+                        step=5,
+                        value=60,
+                        interactive=True,
+                    )
+        goto_askivy_page = gr.Button(value="Ask Ivy", link="/ask-ivy", scale=0.5)
+
+    progress_bar = gr.HTML()
+
+    with gr.Row():
+        question_text = gr.Textbox(
+            label="Evaluation Question",
+            value="",
+            interactive=False,
+            scale=5,
+        )
+        submit_question_button = gr.Button(value="Submit", variant="primary")
+        skip_question_button = gr.Button(value="Skip Question")
+    response_text = gr.Textbox(
+        label="Evaluation Response",
+        placeholder="Response will appear here..",
+        value="",
+        interactive=False,
+        scale=1,
+        lines=5,
+    )
+
+    def get_metric_name(metric_name):
+        return f"""
+            <p>
+                <div class="tooltip">{metric_name}
+                <i class="fa fa-info-circle" style="font-size:10px;color:#007bff"></i>
+                    <span class="tooltiptext" style="font-size:10px">{EVALUATION_METRIC_DESCRIPTION[metric_name]}</span>
+                </div>
+            </p>
+        """
+
+    metrics_evaluation_html = gr.HTML(
+        f"""
+    <link rel="stylesheet" href="https://cdnjs.cloudflare.com/ajax/libs/font-awesome/6.0.0-beta3/css/all.min.css">
+    <div class='your-eval-container'>Enter your evaluations below</div> <br />
+    <div class="eval-container">
+        <table>
+            <thead>
+                <tr>
+                    <th>Metrics</th>
+                    <th>Strongly Disagree</th>
+                    <th>Somewhat Disagree</th>
+                    <th>Neutral</th>
+                    <th>Somewhat Agree</th>
+                    <th>Strongly Agree</th>
+                </tr>
+            </thead>
+            <tbody>
+                <tr style="background-color: #f9f9f9;">
+                    <td>{get_metric_name("Correctness")}</td>
+                    <td class="likert-label"><input type="radio" name="metric1" value="Strongly Disgree"></td>
+                    <td class="likert-label"><input type="radio" name="metric1" value="Somewhat Disagree"></td>
+                    <td class="likert-label"><input type="radio" name="metric1" value="Neutral"></td>
+                    <td class="likert-label"><input type="radio" name="metric1" value="Somewhat Agree"></td>
+                    <td class="likert-label"><input type="radio" name="metric1" value="Strongly Agree"></td>
+                </tr>
+                <tr style="background-color: #f0f0f0;">
+                    <td>{get_metric_name("Completeness")}</td>
+                    <td class="likert-label"><input type="radio" name="metric2" value="Strongly Disgree"></td>
+                    <td class="likert-label"><input type="radio" name="metric2" value="Somewhat Disagree"></td>
+                    <td class="likert-label"><input type="radio" name="metric2" value="Neutral"></td>
+                    <td class="likert-label"><input type="radio" name="metric2" value="Somewhat Agree"></td>
+                    <td class="likert-label"><input type="radio" name="metric2" value="Strongly Agree"></td>
+                </tr>
+                <tr style="background-color: #f9f9f9;">
+                    <td>{get_metric_name("Confidence")}</td>
+                    <td class="likert-label"><input type="radio" name="metric3" value="Strongly Disgree"></td>
+                    <td class="likert-label"><input type="radio" name="metric3" value="Somewhat Disagree"></td>
+                    <td class="likert-label"><input type="radio" name="metric3" value="Neutral"></td>
+                    <td class="likert-label"><input type="radio" name="metric3" value="Somewhat Agree"></td>
+                    <td class="likert-label"><input type="radio" name="metric3" value="Strongly Agree"></td>
+                </tr>
+                <tr style="background-color: #f0f0f0;">
+                    <td>{get_metric_name("Comprehensibility")}</td>
+                    <td class="likert-label"><input type="radio" name="metric4" value="Strongly Disgree"></td>
+                    <td class="likert-label"><input type="radio" name="metric4" value="Somewhat Disagree"></td>
+                    <td class="likert-label"><input type="radio" name="metric4" value="Neutral"></td>
+                    <td class="likert-label"><input type="radio" name="metric4" value="Somewhat Agree"></td>
+                    <td class="likert-label"><input type="radio" name="metric4" value="Strongly Agree"></td>
+                </tr>
+                <tr style="background-color: #f9f9f9;">
+                    <td>{get_metric_name("Compactness")}</td>
+                    <td class="likert-label"><input type="radio" name="metric5" value="Strongly Disgree"></td>
+                    <td class="likert-label"><input type="radio" name="metric5" value="Somewhat Disagree"></td>
+                    <td class="likert-label"><input type="radio" name="metric5" value="Neutral"></td>
+                    <td class="likert-label"><input type="radio" name="metric5" value="Somewhat Agree"></td>
+                    <td class="likert-label"><input type="radio" name="metric5" value="Strongly Agree"></td>
+                </tr>
+            </tbody>
+        </table>
+    </div><br />"""
+    )
+
+    with gr.Row():
+        clear_button = gr.Button(value="Clear Rating", variant="stop")
+        submit_rating_button = gr.Button(value="Next Question", variant="primary")
+
+    def get_eval_dot_html(num, color_style):
+        return f"""<div class="dot {color_style}">{num}</div>"""
+
+    def create_progress_indicator(current_question):
+        progress_html = """
+        <div class="top-container">
+            <div>
+                <div class="progress-text">Evaluation Progress</div>
+                <div class="dots">
+                    %s
+                </div>
+            </div>
+        </div>"""
+        progress_dots_html = ""
+        for i in range(len(EVALUATION_QUESTIONS)):
+            if i < current_question:
+                style = "green-dot"
+            elif i > current_question:
+                style = "red-dot"
+            else:
+                style = "yellow-dot"
+            progress_dots_html += get_eval_dot_html(i + 1, style)
+        progress_html = progress_html % progress_dots_html
+        return progress_html
+
+    submit_question_button.click(get_mcm_response, question_text, response_text)
+
+    def get_submit_rating_btn():
+        if EVALUATION_QUESTION_NUM == len(EVALUATION_QUESTIONS) - 1:
+            return gr.Button(
+                value="Submit and Finish Evaluation",
+                variant="primary",
+                link="/ask-ivy",
+            )
+        else:
+            return submit_rating_button
+
+    def get_skip_question_btn():
+        if EVALUATION_QUESTION_NUM == len(EVALUATION_QUESTIONS) - 1:
+            return gr.Button(value="Skip Question", interactive=False)
+        else:
+            return skip_question_button
+
+    def skip_eval_question():
+        global EVALUATION_QUESTIONS
+        global EVALUATION_QUESTION_NUM
+        EVALUATION_QUESTION_NUM += 1
+        return [
+            create_progress_indicator(EVALUATION_QUESTION_NUM),
+            EVALUATION_QUESTIONS[EVALUATION_QUESTION_NUM][1],
+            "",
+            get_submit_rating_btn(),
+            get_skip_question_btn(),
+        ]
+
+    skip_question_button.click(
+        skip_eval_question,
+        [],
+        [
+            progress_bar,
+            question_text,
+            response_text,
+            submit_rating_button,
+            skip_question_button,
+        ],
+    )
+
+    clear_evaluation_rating_js = """
+        function clear_selection() {
+            selections = document.querySelectorAll('input[type="radio"]')
+            selections.forEach(radio => {
+                radio.checked = false;
+            })
+        }"""
+    clear_button.click(
+        None,
+        inputs=[],
+        outputs=[],
+        js=clear_evaluation_rating_js,
+    )
+
+    def log_evaluation_response(response_text, eval_ratings):
+        timestamp = time.time()
+        dt = datetime.fromtimestamp(timestamp)
+        timestamp = dt.strftime("%b-%d-%Y_%H:%M")
+        global EVALUATION_QUESTIONS
+        global EVALUATION_QUESTION_NUM
+        eval_response_data = {
+            "Timestamp": timestamp,
+            "Username": USERNAME,
+            "SessionId": ACCESS_TOKEN,
+            "Skill": MCM_SKILL,
+            "Question": EVALUATION_QUESTIONS[EVALUATION_QUESTION_NUM][1],
+            "QuestionType": EVALUATION_QUESTIONS[EVALUATION_QUESTION_NUM][0],
+            "Response": response_text,
+            "Metric_Correctness": eval_ratings[0],
+            "Metric_Completeness": eval_ratings[1],
+            "Metric_Confidence": eval_ratings[2],
+            "Metric_Comprehensibility": eval_ratings[3],
+            "Metric_Compactness": eval_ratings[4],
+        }
+        evaluation_responses_table.put_item(Item=eval_response_data)
+
+    def submit_rating_clear_update_question(response_concatenated_eval_ratings):
+        response_text, concatenated_eval_ratings = (
+            response_concatenated_eval_ratings.split("-")
+        )
+        log_evaluation_response(response_text, concatenated_eval_ratings.split(","))
+        global EVALUATION_QUESTIONS
+        global EVALUATION_QUESTION_NUM
+        EVALUATION_QUESTION_NUM += 1
+        return [
+            create_progress_indicator(EVALUATION_QUESTION_NUM),
+            EVALUATION_QUESTIONS[EVALUATION_QUESTION_NUM][1],
+            "",
+            get_submit_rating_btn(),
+            get_skip_question_btn(),
+        ]
+
+    submit_rating_button_js = """
+        function fetch_ratings_and_clear(response_text) {
+            metric1_value = document.querySelector('input[name="metric1"]:checked')?.value || 'None';
+            metric2_value = document.querySelector('input[name="metric2"]:checked')?.value || 'None';
+            metric3_value = document.querySelector('input[name="metric3"]:checked')?.value || 'None';
+            metric4_value = document.querySelector('input[name="metric4"]:checked')?.value || 'None';
+            metric5_value = document.querySelector('input[name="metric5"]:checked')?.value || 'None';
+            
+            document.querySelectorAll('input[type="radio"]').forEach(radio => {
+                radio.checked = false;
+            });
+            
+            return response_text + '-' + [metric1_value, metric2_value, metric3_value, metric4_value, metric5_value].join();
+        }
+        """
+    submit_rating_button.click(
+        submit_rating_clear_update_question,
+        inputs=[response_text],
+        outputs=[
+            progress_bar,
+            question_text,
+            response_text,
+            submit_rating_button,
+            skip_question_button,
+        ],
+        js=submit_rating_button_js,
+    )
+
+    def update_eval_questions(skill_name):
+        response = evaluation_questions_table.scan(
+            FilterExpression=boto3.dynamodb.conditions.Attr("Skill").eq(skill_name)
+        )
+        response = response.get("Items", [])
+        global EVALUATION_QUESTIONS
+        EVALUATION_QUESTIONS = []
+        global EVALUATION_QUESTION_NUM
+        EVALUATION_QUESTION_NUM = 0
+        for question_dict in response:
+            EVALUATION_QUESTIONS.append(
+                (question_dict["QuestionType"], question_dict["Question"])
+            )
+        EVALUATION_QUESTIONS.sort()
+
+    def update_skill(skill_name):
+        global MCM_SKILL
+        MCM_SKILL = skill_name
+        global MCM_URL
+        MCM_URL = SKILL_NAME_TO_MCM_URL[skill_name]
+        update_eval_questions(skill_name)
+        global EVALUATION_QUESTIONS
+        global EVALUATION_QUESTION_NUM
+        return [
+            EVALUATION_QUESTIONS[EVALUATION_QUESTION_NUM][1],
+            "",
+            create_progress_indicator(EVALUATION_QUESTION_NUM),
+        ]
+
+    def on_eval_page_load(skill_name):
+        print("EVAL page load")
+        global MCM_SKILL
+        print("MCM_SKILL", MCM_SKILL)
+        if MCM_SKILL:
+            skill_name = MCM_SKILL  # Maintain state across pages
+        global EVALUATION_QUESTION_NUM
+        first_question_to_display = update_skill(skill_name)[0]
+        return [
+            create_progress_indicator(EVALUATION_QUESTION_NUM),
+            first_question_to_display,
+            skill_name,
+        ]
+
+    evaluation_page.load(
+        on_eval_page_load, [mcm_skill], [progress_bar, question_text, mcm_skill]
+    )
+    mcm_skill.change(
+        update_skill, [mcm_skill], [question_text, response_text, progress_bar]
+    )
 
 app = gr.mount_gradio_app(app, ivy_main_page, path="/ask-ivy", root_path="/ask-ivy")
 app = gr.mount_gradio_app(
